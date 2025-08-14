@@ -32,7 +32,7 @@ def save_excel_snapshot(pid=25308, iterations=10, interval_sec=10):
     wb = xl.ActiveWorkbook
     sheet = wb.ActiveSheet
 
-    desktop = os.path.join(os.path.expanduser("~"), "Desktop", "export")
+    desktop = os.path.join(os.path.expanduser("~"), "Desktop", "export", "data")
 
     for i in range(iterations):
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
