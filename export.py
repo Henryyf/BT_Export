@@ -1,90 +1,106 @@
-import os
+import xlwings as xw
+import csv
 import time
-import datetime
-import psutil
-import pythoncom
-import win32com.client
+import json
+import os
+import string
 
+def getcsd():
+    return os.getcwd() + os.sep
 
-def save_excel_snapshot_fixed_range(
-    pid=25308,
-    iterations=10,
-    interval_sec=10,
-    out_dir=os.path.join(os.path.expanduser("~"), "Desktop", "export", "data"),
-    all_sheets=False,        # set True to export A1:J100 from every sheet
-    sheet_name=None          # set to a specific sheet name to force that sheet
-):
-    # 1) Verify PID
-    try:
-        proc = psutil.Process(pid)
-    except psutil.NoSuchProcess:
-        raise RuntimeError(f"No process with PID {pid} was found.")
-    if "EXCEL" not in proc.name().upper():
-        raise RuntimeError(f"PID {pid} is not an Excel process.")
+# Connect to Excel
+app = xw.apps.active
+wb = app.books[0]
+sheet = wb.sheets[0]
 
-    # 2) Attach to running Excel instance
-    pythoncom.CoInitialize()
-    try:
-        xl = win32com.client.GetActiveObject("Excel.Application")
-    except Exception as e:
-        raise RuntimeError("Could not attach to running Excel instance.") from e
+# JSON path
+row_header_keypath = getcsd() + "keys.json"
 
-    if xl.Workbooks.Count == 0:
-        raise RuntimeError("No workbook is currently open in Excel.")
-    wb = xl.ActiveWorkbook
+# Initialize sets and mappings
+pos0_set = set()
+pos1_set = set()
+local_row_name_to_index = {}
+local_col_name_to_alpha_index = {}
 
-    # 3) Prepare output
-    os.makedirs(out_dir, exist_ok=True)
-    xl.DisplayAlerts = False
-
-    # Helper to export a single sheet's A1:J100 as CSV (values only)
-    def export_sheet_range(sh):
-        # Fixed range A1:J100 regardless of UsedRange/headers/formulas
-        src = sh.Range("A1:J100")
-        # Create a temporary workbook and copy immediate values only
-        temp_wb = xl.Workbooks.Add()
-        dest = temp_wb.ActiveSheet.Range("A1").Resize(src.Rows.Count, src.Columns.Count)
-        dest.Value2 = src.Value2  # immediate values (numeric/text), no formulas, no formats
-
-        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        base = (sheet_name or sh.Name).replace(os.sep, "_")
-        csv_path = os.path.join(out_dir, f"{base}_{ts}.csv")
-
-        # Save as CSV (try UTF-8 first, then fallback to standard CSV)
-        # xlCSVUTF8 = 62, xlCSV = 6
-        try:
-            temp_wb.SaveAs(csv_path, FileFormat=62)  # UTF-8 if supported
-        except Exception:
-            temp_wb.SaveAs(csv_path, FileFormat=6)   # ANSI fallback
-        finally:
-            temp_wb.Close(SaveChanges=False)
-
-        print(f"Saved {csv_path}")
-
-    # Decide which sheets to export
-    def sheets_to_export():
-        if sheet_name:
+# If keys.json doesn't exist, scan and build it
+if not os.path.exists(row_header_keypath):
+    for cell in sheet.used_range:
+        formula = cell.formula
+        if isinstance(formula, str) and formula.startswith('=BDP('):
             try:
-                return [wb.Sheets(sheet_name)]
+                args = formula[5:-1].split(',')
+                param0 = args[0].strip().strip('"')
+                param1 = args[1].strip().strip('"')
+                pos0_set.add(param0)
+                pos1_set.add(param1)
             except Exception:
-                raise RuntimeError(f"Sheet '{sheet_name}' not found in workbook '{wb.Name}'.")
-        return list(wb.Sheets) if all_sheets else [wb.ActiveSheet]
+                continue
 
+    pos0_list = sorted(list(pos0_set))
+    pos1_list = sorted(list(pos1_set))
+
+    # Map tickers to row numbers starting from 2
+    for i, ticker in enumerate(pos0_list):
+        local_row_name_to_index[ticker] = i + 2
+
+    # Map fields to column letters starting from B
+    for i, field in enumerate(pos1_list):
+        col_letter = string.ascii_uppercase[i + 1]  # B, C, D...
+        local_col_name_to_alpha_index[field] = col_letter
+
+    with open(row_header_keypath, 'w') as f:
+        json.dump({
+            "pos0": pos0_list,
+            "pos1": pos1_list
+        }, f, indent=2)
+
+    # Clear sheet and write formulas
+    sheet.clear_contents()
+    sheet.range("A1").expand().clear()  # Clears all used cells
+    sheet.api.Cells.ClearFormats()      # Clears formatting
+    sheet.api.Cells.ClearComments()     # Clears comments
+    sheet.api.Cells.ClearHyperlinks()   # Clears hyperlinks
+    sheet.api.Cells.ClearNotes()        
+    # Write column headers
+    for field, col in local_col_name_to_alpha_index.items():
+        sheet.range(f"{col}1").value = field
+    # Write row headers and formulas
+    for ticker, row in local_row_name_to_index.items():
+        sheet.range(f"A{row}").value = ticker
+        for field, col in local_col_name_to_alpha_index.items():
+            formula = f'=BDP("{ticker}","{field}")'
+            sheet.range(f"{col}{row}").formula = formula
+
+# Load keys
+with open(row_header_keypath, 'r') as f:
+    keys = json.load(f)
+    pos0_list = keys["pos0"]
+    pos1_list = keys["pos1"]
+
+# Prepare output directory
+os.makedirs("data", exist_ok=True)
+
+def query_download(app, sec_freq, iterations):
     for i in range(iterations):
-        for sh in sheets_to_export():
-            export_sheet_range(sh)
+        timestamp = int(time.time())
+        csv_path = f'data/W2EQ_{timestamp}.csv'
 
-        if i < iterations - 1:
-            time.sleep(interval_sec)
+        with open(csv_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['Row Header', 'Column Header', 'Value', 'Immediate Clause'])
 
+            for ticker in pos0_list:
+                row = local_row_name_to_index[ticker]
+                for field in pos1_list:
+                    col = local_col_name_to_alpha_index[field]
+                    cell = sheet.range(f"{col}{row}")
+                    value = cell.value
+                    clause = 'BDP'
+                    writer.writerow([ticker, field, value, clause])
 
+        print(f"[{i+1}/{iterations}] CSV saved to: {csv_path}")
+        time.sleep(sec_freq)
+
+# Run the function
 if __name__ == "__main__":
-    # Example: active sheet only, 10 iterations, every 10 seconds
-    save_excel_snapshot_fixed_range(
-        pid=25308,
-        iterations=10,
-        interval_sec=10,
-        out_dir=os.path.join(os.path.expanduser("~"), "Desktop", "export", "data"),
-        all_sheets=False,      # set True if you want every sheet exported each time
-        sheet_name=None        # or set like "Sheet1" to force a particular sheet
-    )
+    query_download(app=app, sec_freq=1, iterations=5)
